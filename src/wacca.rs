@@ -16,8 +16,8 @@ impl UnitBoardVersionPacket<'_> {
         for v in &self.unit_board_version {
             s.append(&mut v.as_bytes().to_vec());
         }
-        //s.push(calc_checksum(&s));
-        if self.side {s.push(104)} else {s.push(118)};
+        s.push(calc_checksum(&[s.as_slice(),vec![0x80].as_slice()].concat()));
+        //if self.side {s.push(104)} else {s.push(118)};
         s
     }
 }
