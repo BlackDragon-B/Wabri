@@ -1,14 +1,14 @@
-use std::io::{self, Write};
+use std::{io::{self, Write}, process::Command, str};
 
 use serialport::SerialPort;
 
-pub struct UnitBoardVersionPacket<'a> {
-    pub sync_board_version: &'a str,
-    pub unit_board_version: Vec<&'a str>,
+pub struct UnitBoardVersionPacket {
+    pub sync_board_version: String,
+    pub unit_board_version: Vec<String>,
     pub side: bool,
 }
 
-impl UnitBoardVersionPacket<'_> {
+impl UnitBoardVersionPacket {
     pub fn serialize(&self) -> Vec<u8> {
         let mut s: Vec<u8> = vec![0xA8];
         s.append(&mut self.sync_board_version.as_bytes().to_vec());
@@ -40,8 +40,9 @@ impl CommandPacket {
 
     pub fn new(data: Vec<u8>) -> Result<CommandPacket, &'static str> {
         let checksum: u8 = data[data.len()-2];
-        println!("{:X?}",&data[0..data.len()-2]);
+        println!("{:X?}",&data[0..data.len()-3]);
         println!("{:?}", calc_checksum(&data[0..data.len()-3].to_vec()));
+        println!("{:?}",data.len());
         if calc_checksum(&data[0..data.len()-2].to_vec()) != checksum as u8 {
             return Err("Invalid Checksum")
         };
@@ -56,7 +57,7 @@ impl CommandPacket {
             out: a.0,
             wedge_id: a.1,
             command_id: data[1],
-            data: data[2..data.len()-2].to_vec()
+            data: data[2..data.len()-3].to_vec()
         })
     }
 }
@@ -89,9 +90,11 @@ pub struct TouchLink<'a> {
     pub port: &'a  mut Box<dyn SerialPort>,
     pub sync_board_version: &'a str,
     pub buffer: Vec<u8>,
+    pub buffer2: Vec<u8>,
     pub syncboardparams: SyncBoardParams<'a>,
     pub side: bool,
-    pub touchbuffer: Vec<u8>
+    pub touchbuffer: Vec<u8>,
+    pub wport: &'a  mut Box<dyn SerialPort>,
 }
 impl TouchLink<'_> {
     pub fn poll(&mut self) {
@@ -105,7 +108,7 @@ impl TouchLink<'_> {
         }
     }
     pub fn handle_data(&mut self, buffer: &Vec<u8>) {
-        println!("{:X?}", buffer[0]);
+        println!("{:?} {:X?}", self.side,buffer[0]);
         match buffer[0] {
             0xa0 => {
                 self.scan_active = false;
@@ -118,9 +121,19 @@ impl TouchLink<'_> {
             0xa2 => {
                 self.scan_active = false;
                 let _ = self.port.write(&[ 162, 63, 29, 0, 0, 0, 0 ]);
+                for i in 1..7 {
+                    println!("{:?}",i);
+                    let packet: Result<CommandPacket, &str> = self.issue_command(CommandPacket { out: true, wedge_id: i, command_id: 0xA0, data: Vec::new() });
+                    println!("{:?}", packet);
+                }
             },
             0x94 => {
                 self.scan_active = false;
+                for i in 1..7 {
+                    println!("{:?}",i);
+                    let packet: Result<CommandPacket, &str> = self.issue_command(CommandPacket { out: true, wedge_id: i, command_id: 0x94, data: Vec::new() });
+                    println!("{:?}", packet);
+                }
                 let _ = self.port.write(&[ 148, 0, 20, 0, 0, 0, 0 ]);
             },
             0xc9 => {
@@ -128,9 +141,17 @@ impl TouchLink<'_> {
                 let _ = self.port.write(&[ 201, 0, 73, 0, 0, 0, 0 ]);
             },
             0xa8 => {
+                let mut versions: Vec<String> = Vec::new();
+                for i in 1..7 {
+                    println!("{:?}",i);
+                    let packet = self.issue_command(CommandPacket { out: true, wedge_id: i, command_id: 0xA8, data: Vec::new() });
+                    let data = packet.unwrap().data.to_owned();
+                    let version = str::from_utf8(&data).expect("Error").to_string();
+                    versions.push(version);
+                }
                 let _ = self.port.write(&UnitBoardVersionPacket {
-                    sync_board_version: self.sync_board_version,
-                    unit_board_version: vec!["190514", "190514", "190514", "190514", "190514", "190514"],
+                    sync_board_version: self.sync_board_version.to_string(),
+                    unit_board_version: versions,
                     side: self.side,
                 }.serialize());
             },
@@ -157,5 +178,18 @@ impl TouchLink<'_> {
         self.touchbuffer[35] = calc_checksum(&self.touchbuffer);
         if self.touchbuffer[34] == 127 {self.touchbuffer[34] = 0};
         let _ = self.port.write(&self.touchbuffer);
+    }
+    pub fn issue_command(&mut self, command: CommandPacket) -> Result<CommandPacket, &str>{
+        println!("{:?}",&command.serialize());
+        let _ = self.wport.write(&command.serialize());
+        let data = loop {
+            match self.wport.read(self.buffer2.as_mut_slice()) {
+                Ok(t) => {println!("{:X?}",self.buffer2[..t].to_vec()); break self.buffer2[..t].to_vec()},
+                Err(ref e) if e.kind() == io::ErrorKind::TimedOut => (),
+                Err(e) => eprintln!("{:?}", e),
+            }
+        };
+        println!("{:X?}",data);
+        CommandPacket::new(data)
     }
 }
