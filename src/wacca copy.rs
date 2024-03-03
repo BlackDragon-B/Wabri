@@ -1,10 +1,12 @@
-use std::{io::{self, Write}, str, sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc, Mutex, MutexGuard}, time::{Duration, Instant}};
+use std::{io::{self, Write}, marker::StructuralEq, process::Command, str, sync::{Arc, Mutex, MutexGuard}, time::{Duration, Instant}};
 
 use serialport::SerialPort;
 
 fn fix_touch(byte: u8, side: bool) -> u8 {
     if side {
-        byte.reverse_bits() >> 3
+        println!(byte);
+        println!(byte.reverse_bits() >> 2);
+        byte.reverse_bits() >> 2
     } else {
         byte & 0x7f
     }
@@ -60,7 +62,7 @@ impl CommandPacket {
         };
         let checksum: u8 = data[data.len()-2];
         if c != checksum {
-            println!("check");
+            println!("aaa");
             return Err("Invalid Checksum");
         };
         let a: (bool, u8) = match data[0] {
@@ -89,17 +91,15 @@ pub struct SyncBoardParams<'a> {
     pub param0016: &'a str,
     pub param0032: &'a str,
     pub sync_board_version: &'a str,
-    pub side: bool,
 }
 
 impl SyncBoardParams<'static> {
-    pub fn get(side: bool) -> SyncBoardParams<'static> {
+    pub fn get() -> SyncBoardParams<'static> {
         SyncBoardParams {
             param0000: "    0    0    1    2    3    4    5   15   15   15   15   15   15   11   11   11",
             param0016: "   11   11   11  128  103  103  115  138  127  103  105  111  126  113   95  100",
             param0032: "  101  115   98   86   76   67   68   48  117    0   82  154    0    6   35    4",
             sync_board_version: "190523",
-            side,
         }
     }
 }
@@ -125,42 +125,127 @@ pub struct TouchLink<'a> {
     pub pollrate: Duration,
 
 }
+impl TouchLink<'_> {
+/*     pub fn poll(&mut self) {
+        let binding = self.port.clone();
+        let mut port: std::sync::MutexGuard<'_, Box<dyn SerialPort>> = binding.lock().expect("aaa");
+        match port.read(self.buffer.as_mut_slice()) {
+            Ok(t) => self.handle_data(&self.buffer[..t].to_vec(), port),
+            Err(ref e) if e.kind() == io::ErrorKind::TimedOut => (),
+            Err(e) => eprintln!("{:?}", e),
+        }
+    } */
+    pub fn handle_data(&mut self, buffer: &Vec<u8>, mut port: MutexGuard<'_, Box<dyn SerialPort>>, mut portw: MutexGuard<'_, Box<dyn SerialPort>>) {
+        match buffer[0] {
+            0xa0 => {
+                self.scan_active = false;
+                port.write(&[vec![buffer[0]], self.sync_board_version.as_bytes().to_vec(), vec![44]].concat()).unwrap();
+            },
+            0x77 => {},
+            0x20 => {
+                self.scan_active = false;
+            },
+            0xa2 => {
+                self.scan_active = false;
+                let _ = port.write(&[ 162, 63, 29, 0, 0, 0, 0 ]);
+                for i in 1..7 {
+                    let packet: Result<CommandPacket, &str> = issue_command( ,CommandPacket { out: true, wedge_id: i, command_id: 0xA0, data: Vec::new() });
+                }
+            },
+            0x94 => {
+                self.scan_active = false;
+                for i in 1..7 {
+                    let packet: Result<CommandPacket, &str> = issue_command( ,CommandPacket { out: true, wedge_id: i, command_id: 0x94, data: Vec::new() });
+                }
+                let _ = port.write(&[ 148, 0, 20, 0, 0, 0, 0 ]);
+            },
+            0xc9 => {
+                for i in 1..7 {
+                    let packet: Result<CommandPacket, &str> = issue_command( ,CommandPacket { out: true, wedge_id: i, command_id: 0x90, data: vec![0x14, 0x07, 0x7F, 0x3F,] });
+                }
+                self.scan_active = true;
+                let _ = port.write(&[ 201, 0, 73, 0, 0, 0, 0 ]);
+            },
+            0xa8 => {
+                let mut versions: Vec<String> = Vec::new();
+                for i in 1..7 {
+                    let packet = issue_command( ,CommandPacket { out: true, wedge_id: i, command_id: 0xA8, data: Vec::new() });
+                    let data = packet.unwrap().data.to_owned();
+                    let version = str::from_utf8(&data).expect("Error").to_string();
+                    versions.push(version[..6].to_string());
+                }
+                let _ = port.write(&UnitBoardVersionPacket {
+                    sync_board_version: self.sync_board_version.to_string(),
+                    unit_board_version: versions,
+                    side: self.side,
+                }.serialize());
+            },
+            0x72 => {
+                self.scan_active = false;
+                let param: &str = match buffer[3] {
+                    0x30 => {self.syncboardparams.param0000}
+                    0x31 => {self.syncboardparams.param0016}
+                    0x33 => {self.syncboardparams.param0032}
+                    _ => {""}
+                };
+                let _ = port.write(&[param.as_bytes(), &vec![calc_checksum(&param.as_bytes().to_vec())]].concat());
+            },
+            0x9a => {
+                self.scan_active = false;
+            },
+            _ => {},
+        }
+    }
+    pub fn issue_command(&mut self, command: CommandPacket) -> Result<CommandPacket, &str>{
+        let binding = self.wport.clone();
+        let mut wport = binding.lock().expect("yes");
+        let _ = wport.write(&command.serialize());
+        let data = loop {
+            match wport.read(self.buffer2.as_mut_slice()) {
+                Ok(t) => {break self.buffer2[..t].to_vec()},
+                Err(ref e) if e.kind() == io::ErrorKind::TimedOut => (),
+                Err(e) => eprintln!("{:?}", e),
+            }
+        };
+        CommandPacket::new(data)
+    }
+}
 
-pub fn handle_data(buffer: &Vec<u8>, mut port: std::sync::MutexGuard<'_, Box<dyn SerialPort>>, mut portw: std::sync::MutexGuard<'_, Box<dyn SerialPort>>, params: &SyncBoardParams, mut scan_active: Arc<AtomicBool>) {
+pub fn handle_data(buffer: &Vec<u8>, mut port: std::sync::MutexGuard<'_, Box<dyn SerialPort>>, mut portw: std::sync::MutexGuard<'_, Box<dyn SerialPort>>, params: &SyncBoardParams, scan_active: MutexGuard<'_, bool>) {
     match buffer[0] {
         0xa0 => {
-            scan_active.store(false, Ordering::Relaxed);
+            self.scan_active = false;
             port.write(&[vec![buffer[0]], params.sync_board_version.as_bytes().to_vec(), vec![44]].concat()).unwrap();
         },
         0x77 => {},
         0x20 => {
-            scan_active.store(false, Ordering::Relaxed);
+            self.scan_active = false;
         },
         0xa2 => {
-            scan_active.store(false, Ordering::Relaxed);
+            self.scan_active = false;
             let _ = port.write(&[ 162, 63, 29, 0, 0, 0, 0 ]);
             for i in 1..7 {
-                let packet: Result<CommandPacket, &str> = issue_command(&mut portw ,CommandPacket { out: true, wedge_id: i, command_id: 0xA0, data: Vec::new() });
+                let packet: Result<CommandPacket, &str> = issue_command(portw ,CommandPacket { out: true, wedge_id: i, command_id: 0xA0, data: Vec::new() });
             }
         },
         0x94 => {
-            scan_active.store(false, Ordering::Relaxed);
+            self.scan_active = false;
             for i in 1..7 {
-                let packet: Result<CommandPacket, &str> = issue_command(&mut portw ,CommandPacket { out: true, wedge_id: i, command_id: 0x94, data: Vec::new() });
+                let packet: Result<CommandPacket, &str> = issue_command(portw ,CommandPacket { out: true, wedge_id: i, command_id: 0x94, data: Vec::new() });
             }
             let _ = port.write(&[ 148, 0, 20, 0, 0, 0, 0 ]);
         },
         0xc9 => {
             for i in 1..7 {
-                let packet: Result<CommandPacket, &str> = issue_command(&mut portw ,CommandPacket { out: true, wedge_id: i, command_id: 0x90, data: vec![0x14, 0x07, 0x7F, 0x3F,] });
+                let packet: Result<CommandPacket, &str> = issue_command(portw ,CommandPacket { out: true, wedge_id: i, command_id: 0x90, data: vec![0x14, 0x07, 0x7F, 0x3F,] });
             }
-            scan_active.store(true, Ordering::Relaxed);
+            self.scan_active = true;
             let _ = port.write(&[ 201, 0, 73, 0, 0, 0, 0 ]);
         },
         0xa8 => {
             let mut versions: Vec<String> = Vec::new();
             for i in 1..7 {
-                let packet = issue_command(&mut portw ,CommandPacket { out: true, wedge_id: i, command_id: 0xA8, data: Vec::new() });
+                let packet = issue_command(portw ,CommandPacket { out: true, wedge_id: i, command_id: 0xA8, data: Vec::new() });
                 let data = packet.unwrap().data.to_owned();
                 let version = str::from_utf8(&data).expect("Error").to_string();
                 versions.push(version[..6].to_string());
@@ -168,11 +253,11 @@ pub fn handle_data(buffer: &Vec<u8>, mut port: std::sync::MutexGuard<'_, Box<dyn
             let _ = port.write(&UnitBoardVersionPacket {
                 sync_board_version: params.sync_board_version.to_string(),
                 unit_board_version: versions,
-                side: params.side,
+                side: self.side,
             }.serialize());
         },
         0x72 => {
-            scan_active.store(false, Ordering::Relaxed);
+            self.scan_active = false;
             let param: &str = match buffer[3] {
                 0x30 => {params.param0000}
                 0x31 => {params.param0016}
@@ -182,16 +267,16 @@ pub fn handle_data(buffer: &Vec<u8>, mut port: std::sync::MutexGuard<'_, Box<dyn
             let _ = port.write(&[param.as_bytes(), &vec![calc_checksum(&param.as_bytes().to_vec())]].concat());
         },
         0x9a => {
-            scan_active.store(false, Ordering::Relaxed);
+            self.scan_active = false;
         },
         _ => {},
     }
 }
 
-pub fn touch_recv(port: Arc<Mutex<Box<dyn SerialPort>>>, side: bool) -> Vec<u8> {
+pub fn touch_recv(port: Arc<Mutex<Box<dyn SerialPort>>>, touchbuffer: Arc<Mutex<Vec<u8>>>, side: bool) {
     let mut port = port.lock().expect("yes");
+    let mut touchbuffer = touchbuffer.lock().expect("yes");
     let mut serialbuffer = vec![0; 1000];
-    let mut datar = vec!(0; 24);
     for i in 1..7 {
         let r: usize = 7-i;
         let _ = port.write(&CommandPacket { out: true, wedge_id: i as u8, command_id: 0xA1, data: Vec::new() }.serialize());
@@ -203,18 +288,16 @@ pub fn touch_recv(port: Arc<Mutex<Box<dyn SerialPort>>>, side: bool) -> Vec<u8> 
             }
         };
         if let Ok(ret) = CommandPacket::new(data) {
-            if ret.data.len() >= 4 {
-                datar[r-1 as usize] = fix_touch(ret.data[0], side);
-                datar[(r+6)-1 as usize] = fix_touch(ret.data[1], side);
-                datar[(r+12)-1 as usize] = fix_touch(ret.data[2], side);
-                datar[(r+18)-1 as usize] = fix_touch(ret.data[3], side);
-            }
+            touchbuffer[r as usize] = fix_touch(ret.data[0], side);
+            touchbuffer[(r+6) as usize] = fix_touch(ret.data[1], side);
+            touchbuffer[(r+12) as usize] = fix_touch(ret.data[2], side);
+            touchbuffer[(r+18) as usize] = fix_touch(ret.data[3], side);
         }
     }
-    return datar;
+
 }
 
-pub fn issue_command(mut wport: &mut std::sync::MutexGuard<'_, Box<dyn SerialPort>>, command: CommandPacket) -> Result<CommandPacket, &'static str>{
+pub fn issue_command(mut wport: std::sync::MutexGuard<'_, Box<dyn SerialPort>>, command: CommandPacket) -> Result<CommandPacket, &'static str>{
     let _ = wport.write(&command.serialize());
     let mut serialbuffer = vec![0; 1000];
     let data = loop {
@@ -227,9 +310,9 @@ pub fn issue_command(mut wport: &mut std::sync::MutexGuard<'_, Box<dyn SerialPor
     CommandPacket::new(data)
 }
 
-pub fn touch_send(port: Arc<Mutex<Box<dyn SerialPort>>>, touchbuffer: &mut Vec<u8>) {
+pub fn touch_send(port: Arc<Mutex<Box<dyn SerialPort>>>, touchbuffer: Arc<Mutex<Vec<u8>>>) {
     let mut port = port.lock().unwrap();
-
+    let mut touchbuffer = touchbuffer.lock().unwrap();
     touchbuffer[0] = 129;
     touchbuffer[34] = touchbuffer[34] + 1;
     touchbuffer[35] = 128;
