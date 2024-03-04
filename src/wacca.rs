@@ -1,13 +1,38 @@
-use std::{io::{self, Write}, str, sync::{atomic::{AtomicBool, Ordering}, mpsc, Arc, Mutex, MutexGuard}, time::{Duration, Instant}};
+use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
 
-use serialport::SerialPort;
+use serial2::SerialPort;
 
-fn fix_touch(byte: u8, side: bool) -> u8 {
-    if side {
-        byte.reverse_bits() >> 3
-    } else {
-        byte & 0x7f
+pub struct SyncBoardParams<'a> {
+    pub param0000: &'a str,
+    pub param0016: &'a str,
+    pub param0032: &'a str,
+    pub sync_board_version: &'a str,
+    pub side: bool,
+}
+
+impl SyncBoardParams<'static> {
+    pub fn get(side: &bool) -> SyncBoardParams<'static> {
+        SyncBoardParams {
+            param0000: "    0    0    1    2    3    4    5   15   15   15   15   15   15   11   11   11",
+            param0016: "   11   11   11  128  103  103  115  138  127  103  105  111  126  113   95  100",
+            param0032: "  101  115   98   86   76   67   68   48  117    0   82  154    0    6   35    4",
+            sync_board_version: "190523",
+            side: *side,
+        }
     }
+}
+
+pub struct TouchBinding {
+    pub game_serial: Arc<SerialPort>,
+    pub side: bool,
+}
+
+#[derive(Debug)]
+pub struct CommandPacket {
+    pub out: bool,
+    pub wedge_id: u8,
+    pub command_id: u8,
+    pub data: Vec<u8>
 }
 
 pub struct UnitBoardVersionPacket {
@@ -28,13 +53,6 @@ impl UnitBoardVersionPacket {
         //if self.side {s.push(104)} else {s.push(118)};
         s
     }
-}
-#[derive(Debug)]
-pub struct CommandPacket {
-    pub out: bool,
-    pub wedge_id: u8,
-    pub command_id: u8,
-    pub data: Vec<u8>
 }
 
 impl CommandPacket {
@@ -84,25 +102,6 @@ impl CommandPacket {
     }
 }
 
-pub struct SyncBoardParams<'a> {
-    pub param0000: &'a str,
-    pub param0016: &'a str,
-    pub param0032: &'a str,
-    pub sync_board_version: &'a str,
-    pub side: bool,
-}
-
-impl SyncBoardParams<'static> {
-    pub fn get(side: bool) -> SyncBoardParams<'static> {
-        SyncBoardParams {
-            param0000: "    0    0    1    2    3    4    5   15   15   15   15   15   15   11   11   11",
-            param0016: "   11   11   11  128  103  103  115  138  127  103  105  111  126  113   95  100",
-            param0032: "  101  115   98   86   76   67   68   48  117    0   82  154    0    6   35    4",
-            sync_board_version: "190523",
-            side,
-        }
-    }
-}
 pub fn calc_checksum(data: &Vec<u8>) -> u8 {
     let mut checksum: u8 = 0;
     for byte in data.iter() {
@@ -111,61 +110,35 @@ pub fn calc_checksum(data: &Vec<u8>) -> u8 {
     checksum
 }
 
-pub struct TouchLink<'a> {
-    pub scan_active: bool,
-    pub port: Arc<Mutex<Box<dyn SerialPort>>>,
-    pub sync_board_version: &'a str,
-    pub buffer: Vec<u8>,
-    pub buffer2: Vec<u8>,
-    pub syncboardparams: SyncBoardParams<'a>,
-    pub side: bool,
-    pub touchbuffer: Arc<Mutex<Vec<u8>>>,
-    pub wport: Arc<Mutex<Box<dyn SerialPort>>>,
-    pub time: Instant,
-    pub pollrate: Duration,
-
-}
-
-pub fn handle_data(buffer: &Vec<u8>, mut port: std::sync::MutexGuard<'_, Box<dyn SerialPort>>, mut portw: std::sync::MutexGuard<'_, Box<dyn SerialPort>>, params: &SyncBoardParams, mut scan_active: Arc<AtomicBool>) {
+pub fn handle_data(buffer: &Vec<u8>, params: &SyncBoardParams, mut scan_active: Arc<AtomicBool>) -> Option<Vec<u8>> {
     match buffer[0] {
         0xa0 => {
             scan_active.store(false, Ordering::Relaxed);
-            port.write(&[vec![buffer[0]], params.sync_board_version.as_bytes().to_vec(), vec![44]].concat()).unwrap();
+            return Some([vec![buffer[0]], params.sync_board_version.as_bytes().to_vec(), vec![44]].concat().to_vec());
         },
-        0x77 => {},
+        0x77 => {
+            return None;
+        },
         0x20 => {
             scan_active.store(false, Ordering::Relaxed);
+            return None;
         },
         0xa2 => {
             scan_active.store(false, Ordering::Relaxed);
-            let _ = port.write(&[ 162, 63, 29, 0, 0, 0, 0 ]);
-            for i in 1..7 {
-                let packet: Result<CommandPacket, &str> = issue_command(&mut portw ,CommandPacket { out: true, wedge_id: i, command_id: 0xA0, data: Vec::new() });
-            }
+            return Some(vec![ 162, 63, 29, 0, 0, 0, 0 ]);
         },
         0x94 => {
             scan_active.store(false, Ordering::Relaxed);
-            for i in 1..7 {
-                let packet: Result<CommandPacket, &str> = issue_command(&mut portw ,CommandPacket { out: true, wedge_id: i, command_id: 0x94, data: Vec::new() });
-            }
-            let _ = port.write(&[ 148, 0, 20, 0, 0, 0, 0 ]);
+            return Some(vec![ 148, 0, 20, 0, 0, 0, 0 ]);
         },
         0xc9 => {
-            for i in 1..7 {
-                let packet: Result<CommandPacket, &str> = issue_command(&mut portw ,CommandPacket { out: true, wedge_id: i, command_id: 0x90, data: vec![0x14, 0x07, 0x7F, 0x3F,] });
-            }
             scan_active.store(true, Ordering::Relaxed);
-            let _ = port.write(&[ 201, 0, 73, 0, 0, 0, 0 ]);
+            return Some(vec![ 201, 0, 73, 0, 0, 0, 0 ]);
         },
         0xa8 => {
-            let mut versions: Vec<String> = Vec::new();
-            for i in 1..7 {
-                let packet = issue_command(&mut portw ,CommandPacket { out: true, wedge_id: i, command_id: 0xA8, data: Vec::new() });
-                let data = packet.unwrap().data.to_owned();
-                let version = str::from_utf8(&data).expect("Error").to_string();
-                versions.push(version[..6].to_string());
-            }
-            let _ = port.write(&UnitBoardVersionPacket {
+            //let mut versions: Vec<String> = Vec::new();
+            let mut versions = vec!["190523".to_string(), "190523".to_string(), "190523".to_string(), "190523".to_string(), "190523".to_string(), "190523".to_string()];
+            return Some(UnitBoardVersionPacket {
                 sync_board_version: params.sync_board_version.to_string(),
                 unit_board_version: versions,
                 side: params.side,
@@ -179,61 +152,14 @@ pub fn handle_data(buffer: &Vec<u8>, mut port: std::sync::MutexGuard<'_, Box<dyn
                 0x33 => {params.param0032}
                 _ => {""}
             };
-            let _ = port.write(&[param.as_bytes(), &vec![calc_checksum(&param.as_bytes().to_vec())]].concat());
+            return Some([param.as_bytes(), &vec![calc_checksum(&param.as_bytes().to_vec())]].concat())
         },
         0x9a => {
             scan_active.store(false, Ordering::Relaxed);
+            return None;
         },
-        _ => {},
+        _ => {
+            return None;
+        },
     }
-}
-
-pub fn touch_recv(port: Arc<Mutex<Box<dyn SerialPort>>>, side: bool) -> Vec<u8> {
-    let mut port = port.lock().expect("yes");
-    let mut serialbuffer = vec![0; 1000];
-    let mut datar = vec!(0; 24);
-    for i in 1..7 {
-        let r: usize = 7-i;
-        let _ = port.write(&CommandPacket { out: true, wedge_id: i as u8, command_id: 0xA1, data: Vec::new() }.serialize());
-        let data = loop {
-            match port.read(serialbuffer.as_mut_slice()) {
-                Ok(t) => {break serialbuffer[..t].to_vec()},
-                Err(ref e) if e.kind() == io::ErrorKind::TimedOut => (),
-                Err(e) => eprintln!("{:?}", e),
-            }
-        };
-        if let Ok(ret) = CommandPacket::new(data) {
-            if ret.data.len() >= 4 {
-                datar[r-1 as usize] = fix_touch(ret.data[0], side);
-                datar[(r+6)-1 as usize] = fix_touch(ret.data[1], side);
-                datar[(r+12)-1 as usize] = fix_touch(ret.data[2], side);
-                datar[(r+18)-1 as usize] = fix_touch(ret.data[3], side);
-            }
-        }
-    }
-    return datar;
-}
-
-pub fn issue_command(mut wport: &mut std::sync::MutexGuard<'_, Box<dyn SerialPort>>, command: CommandPacket) -> Result<CommandPacket, &'static str>{
-    let _ = wport.write(&command.serialize());
-    let mut serialbuffer = vec![0; 1000];
-    let data = loop {
-        match wport.read(serialbuffer.as_mut_slice()) {
-            Ok(t) => {break serialbuffer[..t].to_vec()},
-            Err(ref e) if e.kind() == io::ErrorKind::TimedOut => (),
-            Err(e) => eprintln!("{:?}", e),
-        }
-    };
-    CommandPacket::new(data)
-}
-
-pub fn touch_send(port: Arc<Mutex<Box<dyn SerialPort>>>, touchbuffer: &mut Vec<u8>) {
-    let mut port = port.lock().unwrap();
-
-    touchbuffer[0] = 129;
-    touchbuffer[34] = touchbuffer[34] + 1;
-    touchbuffer[35] = 128;
-    touchbuffer[35] = calc_checksum(&touchbuffer);
-    if touchbuffer[34] == 127 {touchbuffer[34] = 0};
-    let _ = port.write(&touchbuffer);
 }

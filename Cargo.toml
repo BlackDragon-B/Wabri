@@ -1,8 +1,7 @@
 [package]
-name = "Wabri"
+name = "wabri"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-serialport = "4.3.0"
-tokio = { version = "1.36.0", features=["full"] }
+serial2 = "0.2.20"
