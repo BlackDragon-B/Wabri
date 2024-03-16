@@ -1,4 +1,4 @@
-use std::sync::{atomic::{AtomicBool, Ordering}, Arc};
+use std::{io::{self, Read, Write}, str, sync::{atomic::{AtomicBool, Ordering}, mpsc::{Receiver, Sender}, Arc, Mutex}, thread, time::{Duration, Instant}};
 
 use serial2::SerialPort;
 
@@ -24,6 +24,7 @@ impl SyncBoardParams<'static> {
 
 pub struct TouchBinding {
     pub game_serial: Arc<SerialPort>,
+    pub wedge_serial: Arc<Mutex<SerialPort>>,
     pub side: bool,
 }
 
@@ -71,15 +72,18 @@ impl CommandPacket {
         if data[data.len()-1] == 0 {
             data = data[..data.len()-1].to_vec();
         } 
-        let c: u8 = if data[1] == 0xA1 {
-            calc_checksum(&[data[0..data.len()-2].to_vec(), vec![0x80]].concat())
-        } else {
-            calc_checksum(&data[0..data.len()-2].to_vec())
-        };
+        //let c: u8 = if data[1] == 0xA1 {
+        //    calc_checksum(&[data[0..data.len()-2].to_vec(), vec![0x80]].concat())
+        //} else {
+        let c = calc_checksum(&data[0..data.len()-2].to_vec());
+
         let checksum: u8 = data[data.len()-2];
         if c != checksum {
-            println!("check");
-            return Err("Invalid Checksum");
+            if calc_checksum(&[data[0..data.len()-2].to_vec(), vec![0x80]].concat()) != checksum {
+                println!("check");
+                println!("{:X?}",data);
+                return Err("Invalid Checksum");    
+            }
         };
         let a: (bool, u8) = match data[0] {
             209..215 => (false, data[0]-208),
@@ -110,7 +114,8 @@ pub fn calc_checksum(data: &Vec<u8>) -> u8 {
     checksum
 }
 
-pub fn handle_data(buffer: &Vec<u8>, params: &SyncBoardParams, mut scan_active: Arc<AtomicBool>) -> Option<Vec<u8>> {
+pub fn handle_data(buffer: &Vec<u8>, params: &SyncBoardParams, mut scan_active: Arc<AtomicBool>, mut wedge: std::sync::MutexGuard<'_,  SerialPort>) -> Option<Vec<u8>> {
+    println!("aaaa {:?}",buffer[0]);
     match buffer[0] {
         0xa0 => {
             scan_active.store(false, Ordering::Relaxed);
@@ -125,19 +130,37 @@ pub fn handle_data(buffer: &Vec<u8>, params: &SyncBoardParams, mut scan_active: 
         },
         0xa2 => {
             scan_active.store(false, Ordering::Relaxed);
+            for i in 1..7 {
+                let packet = issue_command(&wedge,&CommandPacket { out: true, wedge_id: i, command_id: 0xA0, data: Vec::new()});
+            }
             return Some(vec![ 162, 63, 29, 0, 0, 0, 0 ]);
         },
         0x94 => {
             scan_active.store(false, Ordering::Relaxed);
+            for i in 1..7 {
+                let packet = issue_command(&wedge,&CommandPacket { out: true, wedge_id: i, command_id: 0x94, data: Vec::new() });
+            }
             return Some(vec![ 148, 0, 20, 0, 0, 0, 0 ]);
         },
         0xc9 => {
             scan_active.store(true, Ordering::Relaxed);
+            for i in 1..7 {
+                let packet = issue_command(&wedge,&CommandPacket { out: true, wedge_id: i, command_id: 0x90, data: vec![0x14, 0x07, 0x7F, 0x3F,]});
+            }
             return Some(vec![ 201, 0, 73, 0, 0, 0, 0 ]);
         },
         0xa8 => {
-            //let mut versions: Vec<String> = Vec::new();
-            let mut versions = vec!["190523".to_string(), "190523".to_string(), "190523".to_string(), "190523".to_string(), "190523".to_string(), "190523".to_string()];
+            let mut versions: Vec<String> = Vec::new();
+            for i in 1..7 {
+                let packet = issue_command(&wedge,&CommandPacket { out: true, wedge_id: i, command_id: 0xA0, data: Vec::new() });
+                //thread::sleep(Duration::from_secs(1));
+                let data = packet.expect("veri bad");
+                let version = str::from_utf8(&data.data).expect("Error").to_string();
+                versions.push(version[..6].to_string());
+                println!("{:?}", data)
+
+            }
+            //let mut versions = vec!["190523".to_string(), "190523".to_string(), "190523".to_string(), "190523".to_string(), "190523".to_string(), "190523".to_string()];
             return Some(UnitBoardVersionPacket {
                 sync_board_version: params.sync_board_version.to_string(),
                 unit_board_version: versions,
@@ -161,5 +184,32 @@ pub fn handle_data(buffer: &Vec<u8>, params: &SyncBoardParams, mut scan_active: 
         _ => {
             return None;
         },
+    }
+}
+
+pub(crate) fn issue_command(port: &SerialPort, data: &CommandPacket) -> Result<CommandPacket, &'static str> {
+    let now = Instant::now();
+    let _ = port.write(&data.serialize());
+    //thread::sleep(Duration::from_secs(1));
+    let mut serialbuffer: Vec<u8> = vec![0; 32];
+    println!("afw {:?}",now.elapsed());
+    let data = loop {
+        //println!("hi");
+        match port.read(serialbuffer.as_mut_slice()) { //slow poopy function
+            Ok(t) => {break serialbuffer[..t].to_vec()},
+            Err(ref e) if e.kind() == io::ErrorKind::TimedOut => (),
+            Err(e) => eprintln!("{:?}", e),
+        };
+    };
+    println!("x {:?}",now.elapsed());
+    CommandPacket::new(data)
+}
+
+pub fn fix_touch(byte: u8, side: bool) -> u8 {
+    let side = side.clone();
+    if side {
+        byte.reverse_bits() >> 3
+    } else {
+        byte & 0x7f
     }
 }
